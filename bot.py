@@ -1,27 +1,35 @@
+import os
 import time
 import random
 import logging
+import threading
+
 from dataclasses import dataclass
 from datetime import datetime, timezone
+
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import pandas as pd
 
 from strategy import StrategyEngine
 
 
 # ============================================================
-# CONFIGURATION
+# CONFIG
 # ============================================================
 
 STARTING_BALANCE = 10_000.0
 
-RISK_PER_TRADE = 0.01       # 1% of account
-MAX_DAILY_LOSS = 0.03       # 3%
+RISK_PER_TRADE = 0.01
+MAX_DAILY_LOSS = 0.03
 MAX_OPEN_TRADES = 5
 
-SCAN_INTERVAL = 60           # seconds
+SCAN_INTERVAL = 60
 
-# Paper binary settings
 BINARY_PAYOUT = 0.80
 BINARY_EXPIRY_MINUTES = 5
+
+PORT = int(os.environ.get("PORT", 10000))
 
 
 CRYPTO_SYMBOLS = [
@@ -95,7 +103,6 @@ class PaperAccount:
     def __init__(self):
 
         self.starting_balance = STARTING_BALANCE
-
         self.balance = STARTING_BALANCE
         self.equity = STARTING_BALANCE
 
@@ -107,41 +114,26 @@ class PaperAccount:
         self.wins = 0
         self.losses = 0
 
+        self.lock = threading.Lock()
 
-    # --------------------------------------------------------
-    # CAN TRADE?
-    # --------------------------------------------------------
 
     def can_trade(self):
 
-        if len(self.open_trades) >= MAX_OPEN_TRADES:
+        with self.lock:
 
-            logger.warning(
-                "Maximum open trades reached."
+            if len(self.open_trades) >= MAX_OPEN_TRADES:
+                return False
+
+            loss_limit = (
+                self.starting_balance *
+                MAX_DAILY_LOSS
             )
 
-            return False
+            if self.daily_pnl <= -loss_limit:
+                return False
 
-        daily_loss_limit = (
-            self.starting_balance *
-            MAX_DAILY_LOSS
-        )
+            return True
 
-        if self.daily_pnl <= -daily_loss_limit:
-
-            logger.warning(
-                "Daily loss limit reached: %.2f",
-                self.daily_pnl
-            )
-
-            return False
-
-        return True
-
-
-    # --------------------------------------------------------
-    # POSITION SIZE
-    # --------------------------------------------------------
 
     def position_size(
         self,
@@ -159,52 +151,39 @@ class PaperAccount:
         )
 
         if distance <= 0:
-
             return 0
 
         return risk_money / distance
 
 
-    # --------------------------------------------------------
-    # OPEN TRADE
-    # --------------------------------------------------------
-
     def open_trade(self, trade):
 
-        if not self.can_trade():
+        with self.lock:
 
-            return False
-
-        # Prevent duplicate position
-        # on the same market/symbol.
-
-        for existing in self.open_trades:
-
-            if (
-                existing.market == trade.market
-                and existing.symbol == trade.symbol
-            ):
-
+            if not self.can_trade():
                 return False
 
-        self.open_trades.append(trade)
+            for existing in self.open_trades:
 
-        logger.info(
-            "OPEN | %s | %s | %s | Entry %.5f | "
-            "Confidence %.2f",
-            trade.market,
-            trade.symbol,
-            trade.direction,
-            trade.entry,
-            trade.confidence,
-        )
+                if (
+                    existing.market == trade.market
+                    and existing.symbol == trade.symbol
+                ):
+                    return False
 
-        return True
+            self.open_trades.append(trade)
 
+            logger.info(
+                "OPEN | %s | %s | %s | Entry %.5f | Confidence %.2f",
+                trade.market,
+                trade.symbol,
+                trade.direction,
+                trade.entry,
+                trade.confidence,
+            )
 
-    # --------------------------------------------------------
-    # CLOSE TRADE
-    # --------------------------------------------------------
+            return True
+
 
     def close_trade(
         self,
@@ -213,113 +192,93 @@ class PaperAccount:
         result=None
     ):
 
-        # Binary trade
-        if trade.market == "BINARY":
+        with self.lock:
 
-            stake = trade.amount
+            if trade not in self.open_trades:
+                return
 
-            if result == "WIN":
+            if trade.market == "BINARY":
 
-                pnl = stake * BINARY_PAYOUT
-
-            else:
-
-                pnl = -stake
-
-        # Normal market trade
-        else:
-
-            if trade.direction == "BUY":
-
-                pnl = (
-                    exit_price -
-                    trade.entry
-                ) * trade.amount
+                if result == "WIN":
+                    pnl = trade.amount * BINARY_PAYOUT
+                else:
+                    pnl = -trade.amount
 
             else:
 
-                pnl = (
-                    trade.entry -
-                    exit_price
-                ) * trade.amount
+                if trade.direction == "BUY":
 
+                    pnl = (
+                        exit_price -
+                        trade.entry
+                    ) * trade.amount
 
-        self.balance += pnl
-        self.equity = self.balance
+                else:
 
-        self.daily_pnl += pnl
+                    pnl = (
+                        trade.entry -
+                        exit_price
+                    ) * trade.amount
 
-        if pnl > 0:
+            self.balance += pnl
+            self.equity = self.balance
+            self.daily_pnl += pnl
 
-            self.wins += 1
+            self.open_trades.remove(trade)
+            self.closed_trades.append(trade)
 
-        else:
+            if pnl > 0:
+                self.wins += 1
+            else:
+                self.losses += 1
 
-            self.losses += 1
-
-
-        if trade in self.open_trades:
-
-            self.open_trades.remove(
-                trade
+            logger.info(
+                "CLOSE | %s | %s | P&L %.2f | Balance %.2f",
+                trade.market,
+                trade.symbol,
+                pnl,
+                self.balance,
             )
 
-        self.closed_trades.append(
-            trade
-        )
-
-        logger.info(
-            "CLOSE | %s | %s | %s | "
-            "Exit %.5f | P&L %.2f | Balance %.2f",
-            trade.market,
-            trade.symbol,
-            trade.direction,
-            exit_price,
-            pnl,
-            self.balance,
-        )
-
-
-    # --------------------------------------------------------
-    # STATISTICS
-    # --------------------------------------------------------
 
     def statistics(self):
 
-        total = (
-            self.wins +
-            self.losses
-        )
+        with self.lock:
 
-        if total > 0:
+            total = self.wins + self.losses
 
             win_rate = (
-                self.wins /
-                total
-            ) * 100
+                (self.wins / total) * 100
+                if total
+                else 0
+            )
 
-        else:
-
-            win_rate = 0
-
-
-        return {
-            "balance": self.balance,
-            "daily_pnl": self.daily_pnl,
-            "open_trades": len(
-                self.open_trades
-            ),
-            "closed_trades": len(
-                self.closed_trades
-            ),
-            "wins": self.wins,
-            "losses": self.losses,
-            "win_rate": win_rate,
-        }
+            return {
+                "balance": round(
+                    self.balance,
+                    2
+                ),
+                "daily_pnl": round(
+                    self.daily_pnl,
+                    2
+                ),
+                "open_trades": len(
+                    self.open_trades
+                ),
+                "closed_trades": len(
+                    self.closed_trades
+                ),
+                "wins": self.wins,
+                "losses": self.losses,
+                "win_rate": round(
+                    win_rate,
+                    2
+                ),
+            }
 
 
 # ============================================================
-# TEMPORARY MARKET DATA
+# SIMULATED MARKET DATA
 # ============================================================
 
 class MarketData:
@@ -345,24 +304,6 @@ class MarketData:
 
 
     @classmethod
-    def get_price(cls, symbol):
-
-        base = cls.BASE_PRICES.get(
-            symbol,
-            100
-        )
-
-        movement = random.uniform(
-            -0.002,
-            0.002
-        )
-
-        return base * (
-            1 + movement
-        )
-
-
-    @classmethod
     def get_candles(
         cls,
         symbol,
@@ -375,7 +316,6 @@ class MarketData:
         )
 
         prices = []
-
         price = base
 
         for _ in range(count):
@@ -391,47 +331,60 @@ class MarketData:
 
             prices.append(price)
 
-
         candles = []
 
         for price in prices:
 
-            high = price * (
-                1 + random.uniform(
-                    0,
-                    0.001
-                )
-            )
-
-            low = price * (
-                1 - random.uniform(
-                    0,
-                    0.001
-                )
-            )
-
-            open_price = price * (
-                1 + random.uniform(
-                    -0.0005,
-                    0.0005
-                )
-            )
-
-            volume = random.randint(
-                100,
-                10000
-            )
-
             candles.append({
-                "open": open_price,
-                "high": high,
-                "low": low,
+
+                "open": price * (
+                    1 + random.uniform(
+                        -0.0005,
+                        0.0005
+                    )
+                ),
+
+                "high": price * (
+                    1 + random.uniform(
+                        0,
+                        0.001
+                    )
+                ),
+
+                "low": price * (
+                    1 - random.uniform(
+                        0,
+                        0.001
+                    )
+                ),
+
                 "close": price,
-                "volume": volume,
+
+                "volume": random.randint(
+                    100,
+                    10000
+                ),
             })
 
-
         return candles
+
+
+    @classmethod
+    def get_price(cls, symbol):
+
+        base = cls.BASE_PRICES.get(
+            symbol,
+            100
+        )
+
+        movement = random.uniform(
+            -0.002,
+            0.002
+        )
+
+        return base * (
+            1 + movement
+        )
 
 
 # ============================================================
@@ -450,21 +403,15 @@ class MarketEngine:
 
         self.market = market
         self.symbols = symbols
-
         self.strategy = strategy
         self.account = account
 
-
-    # --------------------------------------------------------
-    # SCAN
-    # --------------------------------------------------------
 
     def scan(self):
 
         for symbol in self.symbols:
 
             if not self.account.can_trade():
-
                 return
 
             try:
@@ -472,8 +419,6 @@ class MarketEngine:
                 candles = MarketData.get_candles(
                     symbol
                 )
-
-                import pandas as pd
 
                 df = pd.DataFrame(
                     candles
@@ -484,31 +429,23 @@ class MarketEngine:
                     .generate_signal(df)
                 )
 
-
                 if result["signal"] == "HOLD":
-
                     continue
-
 
                 self.execute(
                     symbol,
                     result
                 )
 
-
             except Exception as error:
 
                 logger.exception(
-                    "%s scan error for %s: %s",
+                    "%s | %s | %s",
                     self.market,
                     symbol,
-                    error,
+                    error
                 )
 
-
-    # --------------------------------------------------------
-    # EXECUTE PAPER TRADE
-    # --------------------------------------------------------
 
     def execute(
         self,
@@ -519,39 +456,14 @@ class MarketEngine:
         entry = result["price"]
 
         atr = result.get(
-            "atr",
-            entry * 0.01
+            "atr"
         )
 
         if not atr or atr <= 0:
-
             return
 
-
-        # --------------------------------------------
-        # CRYPTO
-        # --------------------------------------------
-
-        if self.market == "CRYPTO":
-
-            stop_distance = atr * 1.5
-            target_distance = atr * 3.0
-
-
-        # --------------------------------------------
-        # FOREX
-        # --------------------------------------------
-
-        elif self.market == "FOREX":
-
-            stop_distance = atr * 1.5
-            target_distance = atr * 3.0
-
-
-        else:
-
-            return
-
+        stop_distance = atr * 1.5
+        target_distance = atr * 3.0
 
         if result["signal"] == "BUY":
 
@@ -577,17 +489,13 @@ class MarketEngine:
                 target_distance
             )
 
-
         amount = self.account.position_size(
             entry,
             stop_loss
         )
 
-
         if amount <= 0:
-
             return
-
 
         trade = Trade(
 
@@ -611,7 +519,6 @@ class MarketEngine:
                 timezone.utc
             ),
         )
-
 
         self.account.open_trade(
             trade
@@ -639,17 +546,13 @@ class BinaryEngine:
         for symbol in BINARY_SYMBOLS:
 
             if not self.account.can_trade():
-
                 return
-
 
             try:
 
                 candles = MarketData.get_candles(
                     symbol
                 )
-
-                import pandas as pd
 
                 df = pd.DataFrame(
                     candles
@@ -660,22 +563,19 @@ class BinaryEngine:
                     .generate_signal(df)
                 )
 
-
                 if result["signal"] == "HOLD":
-
                     continue
-
 
                 self.execute(
                     symbol,
                     result
                 )
 
-
             except Exception as error:
 
                 logger.exception(
-                    "Binary error: %s",
+                    "BINARY | %s | %s",
+                    symbol,
                     error
                 )
 
@@ -695,9 +595,10 @@ class BinaryEngine:
             timezone.utc
         )
 
-        expiry = (
-            now.timestamp() +
-            BINARY_EXPIRY_MINUTES * 60
+        expiry = datetime.fromtimestamp(
+            now.timestamp()
+            + BINARY_EXPIRY_MINUTES * 60,
+            timezone.utc
         )
 
         trade = Trade(
@@ -720,12 +621,8 @@ class BinaryEngine:
 
             opened_at=now,
 
-            expiry_time=datetime.fromtimestamp(
-                expiry,
-                timezone.utc
-            ),
+            expiry_time=expiry,
         )
-
 
         self.account.open_trade(
             trade
@@ -743,7 +640,7 @@ class TradeMonitor:
         self.account = account
 
 
-    def check_trades(self):
+    def check(self):
 
         for trade in list(
             self.account.open_trades
@@ -753,10 +650,9 @@ class TradeMonitor:
                 trade.symbol
             )
 
-
-            # =================================================
+            # --------------------------------------------
             # BINARY
-            # =================================================
+            # --------------------------------------------
 
             if trade.market == "BINARY":
 
@@ -783,7 +679,6 @@ class TradeMonitor:
                             else "LOSS"
                         )
 
-
                     self.account.close_trade(
                         trade,
                         price,
@@ -793,9 +688,9 @@ class TradeMonitor:
                 continue
 
 
-            # =================================================
+            # --------------------------------------------
             # BUY
-            # =================================================
+            # --------------------------------------------
 
             if trade.direction == "BUY":
 
@@ -814,9 +709,9 @@ class TradeMonitor:
                     )
 
 
-            # =================================================
+            # --------------------------------------------
             # SELL
-            # =================================================
+            # --------------------------------------------
 
             else:
 
@@ -847,14 +742,12 @@ class UnifiedTradingBot:
 
         self.strategy = StrategyEngine()
 
-
         self.crypto = MarketEngine(
             "CRYPTO",
             CRYPTO_SYMBOLS,
             self.strategy,
             self.account
         )
-
 
         self.forex = MarketEngine(
             "FOREX",
@@ -863,29 +756,36 @@ class UnifiedTradingBot:
             self.account
         )
 
-
         self.binary = BinaryEngine(
             self.strategy,
             self.account
         )
-
 
         self.monitor = TradeMonitor(
             self.account
         )
 
 
-    # --------------------------------------------------------
-    # STATUS
-    # --------------------------------------------------------
+    def run_cycle(self):
+
+        self.monitor.check()
+
+        if self.account.can_trade():
+
+            self.crypto.scan()
+
+            self.forex.scan()
+
+            self.binary.scan()
+
+        self.status()
+
 
     def status(self):
 
         stats = (
-            self.account
-            .statistics()
+            self.account.statistics()
         )
-
 
         logger.info(
             "ACCOUNT | Balance %.2f | "
@@ -904,99 +804,197 @@ class UnifiedTradingBot:
         )
 
 
-    # --------------------------------------------------------
-    # MAIN LOOP
-    # --------------------------------------------------------
+# ============================================================
+# GLOBAL BOT
+# ============================================================
 
-    def run(self):
+bot = UnifiedTradingBot()
 
-        logger.info("=" * 60)
 
-        logger.info(
-            "UNIFIED PAPER TRADING BOT"
+# ============================================================
+# BACKGROUND TRADING LOOP
+# ============================================================
+
+def trading_loop():
+
+    logger.info("=" * 60)
+    logger.info(
+        "UNIFIED PAPER TRADING BOT STARTED"
+    )
+    logger.info(
+        "CRYPTO + FOREX + BINARY"
+    )
+    logger.info(
+        "PAPER TRADING ONLY"
+    )
+    logger.info(
+        "Starting balance: %.2f",
+        STARTING_BALANCE
+    )
+    logger.info("=" * 60)
+
+    while True:
+
+        try:
+
+            bot.run_cycle()
+
+        except Exception as error:
+
+            logger.exception(
+                "Trading loop error: %s",
+                error
+            )
+
+        time.sleep(
+            SCAN_INTERVAL
         )
 
-        logger.info(
-            "CRYPTO + FOREX + BINARY"
-        )
 
-        logger.info(
-            "PAPER MODE ONLY"
-        )
+# ============================================================
+# HTTP SERVER
+# ============================================================
 
-        logger.info(
-            "Starting balance: %.2f",
-            self.account.balance
-        )
+class HealthHandler(
+    BaseHTTPRequestHandler
+):
 
-        logger.info("=" * 60)
+    def do_GET(self):
 
+        if self.path == "/health":
 
-        while True:
+            self.send_response(200)
 
-            try:
+            self.send_header(
+                "Content-Type",
+                "application/json"
+            )
 
-                # --------------------------------------------
-                # 1. Monitor existing trades
-                # --------------------------------------------
+            self.end_headers()
 
-                self.monitor.check_trades()
+            stats = bot.account.statistics()
 
+            response = (
+                '{'
+                f'"status":"ok",'
+                f'"balance":{stats["balance"]},'
+                f'"open_trades":{stats["open_trades"]},'
+                f'"closed_trades":{stats["closed_trades"]},'
+                f'"win_rate":{stats["win_rate"]}'
+                '}'
+            )
 
-                # --------------------------------------------
-                # 2. Find new trades
-                # --------------------------------------------
+            self.wfile.write(
+                response.encode()
+            )
 
-                if self.account.can_trade():
-
-                    self.crypto.scan()
-
-                    self.forex.scan()
-
-                    self.binary.scan()
-
-
-                # --------------------------------------------
-                # 3. Display statistics
-                # --------------------------------------------
-
-                self.status()
+            return
 
 
-                # --------------------------------------------
-                # 4. Wait
-                # --------------------------------------------
+        if self.path == "/":
 
-                time.sleep(
-                    SCAN_INTERVAL
-                )
+            self.send_response(200)
+
+            self.send_header(
+                "Content-Type",
+                "text/html"
+            )
+
+            self.end_headers()
+
+            stats = bot.account.statistics()
+
+            html = f"""
+            <html>
+            <head>
+                <title>Unified Paper Trading Bot</title>
+            </head>
+
+            <body>
+
+                <h1>Unified Paper Trading Bot</h1>
+
+                <p>
+                    Status:
+                    <strong>RUNNING</strong>
+                </p>
+
+                <p>
+                    Mode:
+                    <strong>PAPER TRADING</strong>
+                </p>
+
+                <hr>
+
+                <p>
+                    Balance:
+                    {stats["balance"]:.2f}
+                </p>
+
+                <p>
+                    Daily P&L:
+                    {stats["daily_pnl"]:.2f}
+                </p>
+
+                <p>
+                    Open Trades:
+                    {stats["open_trades"]}
+                </p>
+
+                <p>
+                    Closed Trades:
+                    {stats["closed_trades"]}
+                </p>
+
+                <p>
+                    Wins:
+                    {stats["wins"]}
+                </p>
+
+                <p>
+                    Losses:
+                    {stats["losses"]}
+                </p>
+
+                <p>
+                    Win Rate:
+                    {stats["win_rate"]:.2f}%
+                </p>
+
+            </body>
+            </html>
+            """
+
+            self.wfile.write(
+                html.encode()
+            )
+
+            return
 
 
-            except KeyboardInterrupt:
+        self.send_response(404)
 
-                logger.info(
-                    "Bot stopped manually."
-                )
-
-                break
+        self.end_headers()
 
 
-            except Exception as error:
-
-                logger.exception(
-                    "Main loop error: %s",
-                    error
-                )
-
-                time.sleep(10)
+    def log_message(
+        self,
+        format,
+        *args
+    ):
+        return
 
 
 # ============================================================
 # START
 # ============================================================
 
-if __name__ == "__main__":
+def start_server():
 
-    bot = UnifiedTradingBot()
+    server = HTTPServer(
+        ("0.0.0.0", PORT),
+        HealthHandler
+    )
 
-    bot.run()
+    logger.info(
+        "HTTP s
